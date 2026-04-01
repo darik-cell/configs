@@ -1,0 +1,151 @@
+" .ideavimrc is a configuration file for IdeaVim plugin. It uses
+"   the same commands as the original .vimrc configuration.
+" You can find a list of commands here: https://jb.gg/h38q75
+" Find more examples here: https://jb.gg/share-ideavimrc
+let mapleader=" "
+
+"" -- Suggested options --
+" Show a few lines of context around the cursor. Note that this makes the
+" text scroll if you mouse-click near the start or end of the window.
+set scrolloff=5
+
+" Do incremental searching`.
+set incsearch
+set hlsearch
+set clipboard^=ideaput
+
+" Don't use Ex mode, use Q for formatting.
+map Q gq
+
+" Переместить текущий таб в противоположную группу по <Ctrl-w>L
+nnoremap <C-w>L :action MoveToOppositeGroup<CR>
+" --- Enable IdeaVim plugins https://jb.gg/ideavim-plugins
+set relativenumber
+set quickscope
+" Highlight copied text
+Plug 'machakann/vim-highlightedyank'
+" Commentary plugin
+Plug 'tpope/vim-commentary'
+Plug 'michaeljsmith/vim-indent-object'
+Plug 'preservim/nerdtree'
+
+
+" Отключение подсветки поиска по Esc в нормальном режиме
+nnoremap <silent> <Esc> :noh<CR><Esc>
+
+" То же самое при выходе из режима вставки
+inoremap <silent> <Esc> <Esc>:noh<CR>
+
+" И в визуальном режиме
+vnoremap <silent> <Esc> <Esc>:noh<CR>
+
+" link -> [link](#link) для WORD под курсором (непробельная последовательность)
+nnoremap <leader>l ciW[<C-r>"](#<C-r>")<Esc>
+
+" Перейти к возвращаемому типу функции
+nmap <Leader>t :action GotoTypeDeclaration<CR>
+nmap <Leader>a :action ActivateAIAssistantToolWindow<CR>
+" Открыть NERDTree по <Leader>j
+nmap <Leader>j :NERDTree<CR>
+" Закрыть NERDTree по <Leader>k
+nmap <Leader>k :NERDTreeClose<CR>
+
+" Перейти к реализации (Go to Implementation) по <Leader>gi
+nmap <Leader>gi :action GotoImplementation<CR>
+
+nnoremap <Leader>cp :action CopyAbsolutePath<CR>
+nmap <Leader>d :action ActivateDatabaseToolWindow<CR>
+nmap <leader>ha :action HideAllWindows<CR>
+
+
+" SQL: выполнить текущий оператор/выделение под курсором по <leader>e
+" Нормальный режим
+nnoremap <Leader>p :action EditorPasteSimple<CR>
+" Визуальный режим (по выделению)
+vnoremap <Leader>p :action EditorPasteSimple<CR>
+
+" <leader>e  — выполнить текущий запрос или выделение
+nmap <leader>e <Action>(Console.Jdbc.Execute)
+vmap <leader>e <Action>(Console.Jdbc.Execute)
+
+" Найти использования (Find Usages) по <Leader>fu
+nmap <Leader>fu :action FindUsages<CR>
+"" -- Map IDE actions to IdeaVim -- https://jb.gg/abva4t
+"" Map \r to the Reformat Code action
+"map \r <Action>(ReformatCode)
+"" Map <leader>d to start debug
+"map <leader>d <Action>(Debug)
+
+"" Map \b to toggle the breakpoint on the current line
+"map \b <Action>(ToggleLineBreakpoint)
+set clipboard+=unnamedplus
+imap jj <Esc>
+imap оо <Esc>
+" перемещение по символам в строке (двухбуквенное)
+" Russian keyboard mapping
+map ё `
+map й q
+map ц w
+map у e
+map к r
+map е t
+map н y
+map г u
+map ш i
+map щ o
+map з p
+map х [
+map ъ ]
+map ф a
+map ы s
+map в d
+map а f
+map п g
+map р h
+map о j
+map л k
+map д l
+map ж ;
+map э '
+map я z
+map ч x
+map с c
+map м v
+map и b
+map т n
+map ь m
+map б ,
+map ю .
+map Ё ~
+map Й Q
+map Ц W
+map У E
+map К R
+map Е T
+map Н Y
+map Г U
+map Ш I
+map Щ O
+map З P
+map Х {
+map Ъ }
+map Ф A
+map Ы S
+map В D
+map А F
+map П G
+map Р H
+map О J
+map Л K
+map Д L
+map Ж :
+map Э "
+map Я Z
+map Ч X
+map С C
+map М V
+map И B
+map Т N
+map Ь M
+map Б <
+map Ю >
