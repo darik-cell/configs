@@ -1,0 +1,5 @@
+Flask
+markdown-it-py
+mdit-py-plugins
+Pygments
+Werkzeug

@@ -1,0 +1,1706 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import html
+import json
+import logging
+import mimetypes
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+import threading
+import urllib.error
+import urllib.request
+import webbrowser
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urlencode, urlsplit
+
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
+from markdown_it import MarkdownIt
+from mdit_py_plugins.tasklists import tasklists_plugin
+from pygments import highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import TextLexer, get_lexer_by_name
+from pygments.util import ClassNotFound
+from werkzeug.serving import WSGIRequestHandler, make_server
+
+
+DEFAULT_PORT = 8765
+DEFAULT_HOST = "127.0.0.1"
+HEALTH_TIMEOUT_SECONDS = 0.4
+SERVER_START_TIMEOUT_SECONDS = 5.0
+SERVER_STOP_TIMEOUT_SECONDS = 3.0
+STATE_VERSION = 1
+MARKDOWN_EXTENSIONS = {".md", ".markdown"}
+ALLOWED_LINK_SCHEMES = {"http", "https", "mailto", "tel"}
+APP = Flask(__name__)
+APP.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+LAUNCH_CWD = Path.cwd()
+SCRIPT_PATH = Path(__file__).resolve()
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "mdview"
+STATE_FILE = STATE_DIR / "server.json"
+PYGMENTS_FORMATTER = HtmlFormatter(cssclass="highlight")
+PYGMENTS_CSS = PYGMENTS_FORMATTER.get_style_defs(".highlight")
+SERVER_METADATA = {
+    "host": DEFAULT_HOST,
+    "port": DEFAULT_PORT,
+    "pid": os.getpid(),
+    "started_at": int(time.time()),
+}
+
+
+HOME_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mdview</title>
+  <style>{{ base_css|safe }}</style>
+</head>
+<body class="home-page">
+  <main class="home-shell">
+    <section class="card">
+      <p class="eyebrow">Markdown Viewer</p>
+      <h1>Open a local <code>.md</code> file in the browser</h1>
+      <p class="lead">Launch with <code>mdview /path/to/file.md</code> or drop a file here.</p>
+      {% if error %}
+      <div class="flash flash-error">{{ error }}</div>
+      {% endif %}
+      <form class="path-form" method="get" action="/view">
+        <input type="hidden" name="cwd" value="{{ cwd_hint }}">
+        <label for="path-input">Path</label>
+        <div class="row">
+          <input id="path-input" type="text" name="path" placeholder="~/notes/today.md" autocomplete="off">
+          <button type="submit">Open</button>
+        </div>
+        <p class="hint">Relative paths resolve from <code>{{ cwd_hint }}</code>.</p>
+      </form>
+      <form id="upload-form" class="upload-form" method="post" action="/render-upload" enctype="multipart/form-data">
+        <input id="file-input" type="file" name="file" accept=".md,.markdown" hidden>
+        <button type="button" id="file-button" class="secondary-button">Choose file</button>
+        <button type="submit">Render upload</button>
+      </form>
+      <div id="drop-zone" class="drop-zone" tabindex="0">
+        <strong>Drop a Markdown file</strong>
+        <span>Upload stays in memory and is rendered as a standalone document.</span>
+      </div>
+    </section>
+  </main>
+  <script>
+    const dropZone = document.getElementById("drop-zone");
+    const fileInput = document.getElementById("file-input");
+    const fileButton = document.getElementById("file-button");
+
+    async function submitFile(file) {
+      const body = new FormData();
+      body.append("file", file);
+      const response = await fetch("/render-upload", {
+        method: "POST",
+        body
+      });
+      const markup = await response.text();
+      document.open();
+      document.write(markup);
+      document.close();
+    }
+
+    fileButton.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", async () => {
+      if (fileInput.files.length) {
+        await submitFile(fileInput.files[0]);
+      }
+    });
+
+    function setDragged(active) {
+      dropZone.classList.toggle("dragged", active);
+    }
+
+    dropZone.addEventListener("dragenter", (event) => {
+      event.preventDefault();
+      setDragged(true);
+    });
+
+    dropZone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      setDragged(true);
+    });
+
+    dropZone.addEventListener("dragleave", (event) => {
+      event.preventDefault();
+      if (event.target === dropZone) {
+        setDragged(false);
+      }
+    });
+
+    dropZone.addEventListener("drop", async (event) => {
+      event.preventDefault();
+      setDragged(false);
+      if (!event.dataTransfer.files.length) {
+        return;
+      }
+      await submitFile(event.dataTransfer.files[0]);
+    });
+
+    dropZone.addEventListener("click", () => fileInput.click());
+    dropZone.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        fileInput.click();
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+VIEW_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <style>{{ base_css|safe }}</style>
+</head>
+<body class="viewer-page">
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Markdown Viewer</p>
+      <h1>{{ source_name }}</h1>
+      <p class="subtitle">{{ source_description }}</p>
+    </div>
+    <div class="topbar-actions">
+      {% if reload_href %}
+      <a class="action-link" href="{{ reload_href }}">Reload</a>
+      {% endif %}
+      <a class="action-link" href="{{ open_home_href }}">Open another file</a>
+    </div>
+  </header>
+
+  {% if source_path and live_update %}
+  <div id="status-banner" class="status-banner">Watching for changes.</div>
+  {% elif upload_mode %}
+  <div class="status-banner">Upload mode: live update is disabled.</div>
+  {% endif %}
+
+  <main class="viewer-grid">
+    <article id="content" class="markdown-body">{{ content_html|safe }}</article>
+    <aside class="toc-card">
+      <h2>Contents</h2>
+      <div id="toc">{{ toc_html|safe }}</div>
+    </aside>
+  </main>
+
+  <div id="copy-toast" class="copy-toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <script>
+    const copyToast = document.getElementById("copy-toast");
+    let copyToastTimer = null;
+
+    function showCopyToast(message, kind = "success") {
+      if (!copyToast) {
+        return;
+      }
+
+      copyToast.textContent = message;
+      copyToast.dataset.kind = kind;
+      copyToast.classList.add("visible");
+      if (copyToastTimer !== null) {
+        window.clearTimeout(copyToastTimer);
+      }
+      copyToastTimer = window.setTimeout(() => {
+        copyToast.classList.remove("visible");
+      }, 1200);
+    }
+
+    function decodeCopyPayload(encoded) {
+      const binary = window.atob(encoded);
+      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+      return new TextDecoder().decode(bytes);
+    }
+
+    function fallbackCopyText(text) {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "readonly");
+      area.style.position = "fixed";
+      area.style.top = "-9999px";
+      area.style.left = "-9999px";
+      document.body.appendChild(area);
+      area.focus();
+      area.select();
+      let ok = false;
+      try {
+        ok = document.execCommand("copy");
+      } finally {
+        document.body.removeChild(area);
+      }
+      return ok;
+    }
+
+    document.addEventListener("click", async (event) => {
+      const link = event.target.closest(".copy-link");
+      if (!link) {
+        return;
+      }
+
+      event.preventDefault();
+      const encoded = link.dataset.copyB64;
+      if (!encoded) {
+        showCopyToast("Copy failed", "error");
+        return;
+      }
+
+      let text = "";
+      try {
+        text = decodeCopyPayload(encoded);
+      } catch (_error) {
+        showCopyToast("Copy failed", "error");
+        return;
+      }
+
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else if (!fallbackCopyText(text)) {
+          throw new Error("Clipboard unavailable");
+        }
+        showCopyToast("Copied");
+      } catch (_error) {
+        if (fallbackCopyText(text)) {
+          showCopyToast("Copied");
+        } else {
+          showCopyToast("Copy failed", "error");
+        }
+      }
+    });
+  </script>
+
+  {% if source_path and live_update %}
+  <script>
+    const watchedPath = {{ source_path|tojson }};
+    const statusBanner = document.getElementById("status-banner");
+    const contentNode = document.getElementById("content");
+    const tocNode = document.getElementById("toc");
+    let lastMtime = {{ mtime_ns }};
+    let pollTimer = null;
+
+    function setStatus(message, kind = "idle") {
+      statusBanner.textContent = message;
+      statusBanner.dataset.kind = kind;
+    }
+
+    async function poll() {
+      try {
+        const metaResponse = await fetch(`/meta?path=${encodeURIComponent(watchedPath)}`, {
+          cache: "no-store",
+          headers: { "Accept": "application/json" }
+        });
+
+        if (!metaResponse.ok) {
+          throw new Error("The source file is no longer readable.");
+        }
+
+        const meta = await metaResponse.json();
+        if (!meta.exists) {
+          throw new Error("The source file no longer exists.");
+        }
+
+        if (meta.mtime_ns !== lastMtime) {
+          setStatus("Change detected. Refreshing view...", "refreshing");
+          const fragmentResponse = await fetch(`/fragment?path=${encodeURIComponent(watchedPath)}`, {
+            cache: "no-store",
+            headers: { "Accept": "application/json" }
+          });
+          if (!fragmentResponse.ok) {
+            throw new Error("Failed to refresh the document.");
+          }
+
+          const fragment = await fragmentResponse.json();
+          contentNode.innerHTML = fragment.content_html;
+          tocNode.innerHTML = fragment.toc_html;
+          document.title = fragment.title;
+          lastMtime = fragment.mtime_ns;
+          setStatus("Updated automatically.", "updated");
+        } else {
+          setStatus("Watching for changes.", "idle");
+        }
+      } catch (error) {
+        setStatus(error.message || "Live update failed.", "error");
+      } finally {
+        pollTimer = window.setTimeout(poll, 1200);
+      }
+    }
+
+    pollTimer = window.setTimeout(poll, 1200);
+    window.addEventListener("beforeunload", () => {
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer);
+      }
+    });
+  </script>
+  {% endif %}
+</body>
+</html>
+"""
+
+
+BASE_CSS = f"""
+:root {{
+  color-scheme: light;
+  --bg: #f3efe7;
+  --paper: #fffdf8;
+  --text: #2a241d;
+  --muted: #70665a;
+  --border: #d8cbb7;
+  --accent: #9d4e2f;
+  --accent-soft: #f3dfcf;
+  --code-bg: #f5efe6;
+  --error: #9d2f2f;
+  --success: #2f7a42;
+  --shadow: 0 18px 48px rgba(85, 59, 31, 0.12);
+}}
+
+* {{
+  box-sizing: border-box;
+}}
+
+body {{
+  margin: 0;
+  font-family: "Iosevka Etoile", "IBM Plex Sans", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top right, rgba(157, 78, 47, 0.12), transparent 24rem),
+    linear-gradient(180deg, #f8f3ea 0%, var(--bg) 100%);
+  color: var(--text);
+}}
+
+code, pre {{
+  font-family: "Iosevka Term", "JetBrains Mono", monospace;
+}}
+
+a {{
+  color: var(--accent);
+}}
+
+.home-shell,
+.viewer-grid,
+.topbar,
+.status-banner {{
+  width: min(1180px, calc(100vw - 2rem));
+  margin: 0 auto;
+}}
+
+.home-shell {{
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem 0;
+}}
+
+.card,
+.toc-card,
+.markdown-body,
+.status-banner,
+.topbar {{
+  background: rgba(255, 253, 248, 0.92);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(216, 203, 183, 0.8);
+  box-shadow: var(--shadow);
+}}
+
+.card {{
+  width: min(760px, 100%);
+  padding: 2rem;
+  border-radius: 24px;
+}}
+
+.eyebrow {{
+  margin: 0 0 0.5rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.78rem;
+  color: var(--muted);
+}}
+
+h1, h2, h3, h4, h5, h6 {{
+  font-family: "IBM Plex Serif", "Georgia", serif;
+  line-height: 1.15;
+}}
+
+.lead,
+.subtitle,
+.hint {{
+  color: var(--muted);
+}}
+
+.row {{
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}}
+
+label {{
+  display: block;
+  margin-bottom: 0.4rem;
+  font-weight: 600;
+}}
+
+input[type="text"] {{
+  flex: 1 1 24rem;
+  padding: 0.9rem 1rem;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--paper);
+  color: var(--text);
+  font-size: 1rem;
+}}
+
+button,
+.action-link {{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.85rem 1.1rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: #fffaf4;
+  cursor: pointer;
+  text-decoration: none;
+  font-weight: 600;
+}}
+
+.secondary-button {{
+  background: transparent;
+  color: var(--accent);
+  border-color: var(--border);
+}}
+
+.path-form,
+.upload-form {{
+  margin-top: 1.4rem;
+}}
+
+.upload-form {{
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  align-items: center;
+}}
+
+.drop-zone {{
+  margin-top: 1.4rem;
+  padding: 1.8rem;
+  border: 2px dashed var(--border);
+  border-radius: 20px;
+  background: linear-gradient(180deg, rgba(243, 223, 207, 0.58), rgba(255, 253, 248, 0.6));
+  cursor: pointer;
+  display: grid;
+  gap: 0.35rem;
+}}
+
+.drop-zone.dragged {{
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}}
+
+.flash,
+.status-banner {{
+  border-radius: 16px;
+  padding: 0.95rem 1rem;
+  margin-top: 1rem;
+}}
+
+.flash-error,
+.status-banner[data-kind="error"] {{
+  color: var(--error);
+  border: 1px solid rgba(157, 47, 47, 0.18);
+  background: rgba(157, 47, 47, 0.08);
+}}
+
+.status-banner[data-kind="updated"] {{
+  color: var(--success);
+  border: 1px solid rgba(47, 122, 66, 0.18);
+  background: rgba(47, 122, 66, 0.08);
+}}
+
+.status-banner[data-kind="refreshing"] {{
+  border: 1px solid rgba(157, 78, 47, 0.2);
+  background: rgba(157, 78, 47, 0.08);
+}}
+
+.viewer-page {{
+  padding-bottom: 2rem;
+}}
+
+.topbar {{
+  margin-top: 1rem;
+  padding: 1.25rem 1.5rem;
+  border-radius: 24px;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}}
+
+.topbar h1 {{
+  margin: 0;
+  font-size: clamp(1.5rem, 1.3rem + 1vw, 2.2rem);
+}}
+
+.topbar .subtitle {{
+  margin-bottom: 0;
+  word-break: break-all;
+}}
+
+.topbar-actions {{
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}}
+
+.viewer-grid {{
+  margin-top: 1rem;
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(260px, 1fr);
+  gap: 1rem;
+  align-items: start;
+}}
+
+.markdown-body,
+.toc-card {{
+  border-radius: 24px;
+}}
+
+.markdown-body {{
+  padding: 2rem;
+  overflow-wrap: anywhere;
+}}
+
+.inline-code-wrap {{
+  position: relative;
+  display: inline-block;
+}}
+
+.markdown-body img {{
+  max-width: 100%;
+  height: auto;
+}}
+
+.markdown-body ul,
+.markdown-body ol {{
+  padding-left: 1.45rem;
+}}
+
+.markdown-body ul:not(.contains-task-list) > li + li,
+.markdown-body ol > li + li {{
+  margin-top: 0.42rem;
+}}
+
+.markdown-body pre {{
+  overflow-x: auto;
+  padding: 1rem;
+  background: var(--code-bg);
+  border-radius: 16px;
+  border: 1px solid rgba(216, 203, 183, 0.7);
+}}
+
+.markdown-body :not(pre) > code {{
+  padding: 0.18rem 0.4rem;
+  border-radius: 0.45rem;
+  background: var(--code-bg);
+  border: 1px solid rgba(216, 203, 183, 0.6);
+  font-size: 0.92em;
+}}
+
+.copy-link {{
+  display: block;
+  text-decoration: none;
+  color: transparent;
+  background: transparent;
+  border: 0;
+  opacity: 0.01;
+  z-index: 3;
+}}
+
+.copy-link-inline {{
+  position: absolute;
+  inset: 0;
+}}
+
+.code-block-wrap {{
+  position: relative;
+}}
+
+.copy-link-block {{
+  position: sticky;
+  top: 1rem;
+  float: right;
+  width: 1.3rem;
+  height: 1.3rem;
+  margin: 0.6rem 0.6rem -1.9rem 0;
+}}
+
+.copy-toast {{
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  padding: 0.7rem 0.95rem;
+  border-radius: 999px;
+  color: #fffaf4;
+  background: rgba(42, 36, 29, 0.92);
+  box-shadow: var(--shadow);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-0.4rem);
+  transition: opacity 120ms ease, transform 120ms ease;
+  z-index: 20;
+}}
+
+.copy-toast[data-kind="error"] {{
+  background: rgba(157, 47, 47, 0.94);
+}}
+
+.copy-toast.visible {{
+  opacity: 1;
+  transform: translateY(0);
+}}
+
+.markdown-body blockquote {{
+  margin: 1.25rem 0;
+  padding: 0.25rem 1rem;
+  border-left: 4px solid var(--accent);
+  color: var(--muted);
+  background: rgba(243, 223, 207, 0.28);
+  border-radius: 0 16px 16px 0;
+}}
+
+.markdown-body table {{
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.25rem 0;
+}}
+
+.markdown-body th,
+.markdown-body td {{
+  border: 1px solid var(--border);
+  padding: 0.7rem 0.8rem;
+  text-align: left;
+}}
+
+.markdown-body th {{
+  background: rgba(243, 223, 207, 0.4);
+}}
+
+.markdown-body ul.contains-task-list {{
+  list-style: none;
+  padding-left: 0;
+}}
+
+.markdown-body .task-list-item {{
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+}}
+
+.toc-card {{
+  position: sticky;
+  top: 1rem;
+  padding: 1.35rem;
+}}
+
+.toc-card h2 {{
+  margin-top: 0;
+  margin-bottom: 0.8rem;
+  font-size: 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}}
+
+.toc-list {{
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.35rem;
+}}
+
+.toc-list a {{
+  display: block;
+  text-decoration: none;
+  color: var(--text);
+  padding: 0.2rem 0;
+}}
+
+.toc-level-2 {{ padding-left: 0.6rem; }}
+.toc-level-3 {{ padding-left: 1.1rem; }}
+.toc-level-4 {{ padding-left: 1.5rem; }}
+.toc-level-5 {{ padding-left: 1.9rem; }}
+.toc-level-6 {{ padding-left: 2.3rem; }}
+
+.toc-empty {{
+  color: var(--muted);
+}}
+
+{PYGMENTS_CSS}
+
+@media (max-width: 920px) {{
+  .viewer-grid {{
+    grid-template-columns: 1fr;
+  }}
+
+  .toc-card {{
+    position: static;
+    order: -1;
+  }}
+}}
+
+@media (max-width: 640px) {{
+  .card,
+  .markdown-body,
+  .toc-card,
+  .topbar {{
+    border-radius: 20px;
+  }}
+
+  .card,
+  .markdown-body {{
+    padding: 1.25rem;
+  }}
+
+  .topbar {{
+    padding: 1rem;
+    flex-direction: column;
+  }}
+
+  .row {{
+    flex-direction: column;
+  }}
+
+  input[type="text"],
+  button,
+  .action-link {{
+    width: 100%;
+  }}
+}}
+"""
+
+
+@dataclass
+class RenderedPage:
+    title: str
+    content_html: str
+    toc_html: str
+    mtime_ns: int | None = None
+
+
+@dataclass
+class ServerProbe:
+    kind: str
+    host: str
+    port: int
+    pid: int | None = None
+    started_at: int | None = None
+    detail: str | None = None
+
+
+class QuietRequestHandler(WSGIRequestHandler):
+    def log(self, _type: str, _message: str, *args: object) -> None:
+        return
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        return
+
+    def log_error(self, _format: str, *args: object) -> None:
+        return
+
+
+def state_dir_url() -> str:
+    return str(STATE_FILE)
+
+
+def slugify(value: str) -> str:
+    normalized = re.sub(r"[^\w\s-]", "", value, flags=re.UNICODE).strip().lower()
+    normalized = re.sub(r"[-\s]+", "-", normalized, flags=re.UNICODE)
+    return normalized or "section"
+
+
+def app_url(host: str, port: int) -> str:
+    return f"http://{host}:{port}"
+
+
+def ensure_state_dir() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def write_state_file(payload: dict[str, object]) -> None:
+    ensure_state_dir()
+    tmp_path = STATE_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(STATE_FILE)
+
+
+def read_state_file() -> dict[str, object] | None:
+    try:
+        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def remove_state_file() -> None:
+    with contextlib.suppress(FileNotFoundError):
+        STATE_FILE.unlink()
+
+
+def remove_state_if_pid_matches(pid: int) -> None:
+    state = read_state_file()
+    if not state:
+        return
+    if int(state.get("pid", -1)) == pid:
+        remove_state_file()
+
+
+def build_state_payload(host: str, port: int, pid: int, started_at: int) -> dict[str, object]:
+    return {
+        "version": STATE_VERSION,
+        "host": host,
+        "port": port,
+        "pid": pid,
+        "started_at": started_at,
+        "script": str(SCRIPT_PATH),
+    }
+
+
+def normalize_base_dir(cwd_value: str | None) -> Path:
+    if not cwd_value or not cwd_value.strip():
+        return LAUNCH_CWD
+    expanded = os.path.expanduser(cwd_value.strip())
+    candidate = Path(expanded)
+    if not candidate.is_absolute():
+        candidate = (LAUNCH_CWD / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+    return LAUNCH_CWD
+
+
+def highlight_code(code: str, language: str, _attrs: str) -> str:
+    language = (language or "").strip()
+    try:
+        lexer = get_lexer_by_name(language) if language else TextLexer()
+    except ClassNotFound:
+        lexer = TextLexer()
+    return highlight(code, lexer, PYGMENTS_FORMATTER)
+
+
+def build_markdown_renderer() -> MarkdownIt:
+    parser = MarkdownIt("commonmark", {"html": False})
+    parser.enable("table")
+    parser.use(tasklists_plugin)
+    parser.renderer.rules["fence"] = render_fence
+    parser.renderer.rules["code_block"] = render_code_block
+    parser.renderer.rules["code_inline"] = render_inline_code
+    return parser
+
+
+def encode_copy_payload(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def render_copy_link(copy_text: str, classes: str, label: str) -> str:
+    payload = html.escape(encode_copy_payload(copy_text), quote=True)
+    return (
+        f'<a href="#copy" class="copy-link {classes}" '
+        f'data-copy-b64="{payload}" aria-label="{html.escape(label, quote=True)}"></a>'
+    )
+
+
+def render_inline_code(tokens: list, index: int, _options: dict, _env: dict) -> str:
+    token = tokens[index]
+    code_html = html.escape(token.content)
+    copy_link = render_copy_link(token.content, "copy-link-inline", "Copy inline code")
+    return f'<span class="inline-code-wrap"><code>{code_html}</code>{copy_link}</span>'
+
+
+def render_fence(tokens: list, index: int, _options: dict, _env: dict) -> str:
+    token = tokens[index]
+    info = (token.info or "").strip()
+    language = info.split(None, 1)[0] if info else ""
+    highlighted = highlight_code(token.content, language, "")
+    copy_link = render_copy_link(token.content, "copy-link-block", "Copy code block")
+    return f'<div class="code-block-wrap">{copy_link}{highlighted}</div>'
+
+
+def render_code_block(tokens: list, index: int, _options: dict, _env: dict) -> str:
+    code = tokens[index].content
+    highlighted = highlight_code(code, "", "")
+    copy_link = render_copy_link(code, "copy-link-block", "Copy code block")
+    return f'<div class="code-block-wrap">{copy_link}{highlighted}</div>'
+
+
+def extract_inline_text(tokens: Iterable) -> str:
+    parts: list[str] = []
+    for token in tokens or []:
+        if token.type == "image":
+            parts.append(token.content)
+        elif token.type == "code_inline":
+            parts.append(token.content)
+        elif token.type == "text":
+            parts.append(token.content)
+        elif token.children:
+            parts.append(extract_inline_text(token.children))
+        elif token.content:
+            parts.append(token.content)
+    return "".join(parts).strip()
+
+
+def safe_remote_url(raw_url: str) -> str:
+    parts = urlsplit(raw_url)
+    scheme = parts.scheme.lower()
+    if scheme and scheme not in ALLOWED_LINK_SCHEMES:
+        return "#"
+    return raw_url
+
+
+def resolve_user_path(path_value: str, cwd_value: str | None = None) -> Path:
+    expanded = os.path.expanduser(path_value.strip())
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = normalize_base_dir(cwd_value) / path
+    return path.resolve()
+
+
+def rewrite_local_url(raw_url: str, base_dir: Path | None, *, asset_mode: bool = False) -> str:
+    if not raw_url:
+        return raw_url
+    if base_dir is None:
+        return safe_remote_url(raw_url)
+    if raw_url.startswith("#"):
+        return raw_url
+
+    parts = urlsplit(raw_url)
+    if parts.scheme or parts.netloc:
+        return safe_remote_url(raw_url)
+    if not parts.path:
+        return raw_url
+
+    candidate = Path(os.path.expanduser(parts.path))
+    if not candidate.is_absolute():
+        candidate = (base_dir / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+
+    fragment = f"#{parts.fragment}" if parts.fragment else ""
+    query = urlencode({"path": str(candidate)})
+    if not asset_mode and candidate.suffix.lower() in MARKDOWN_EXTENSIONS:
+        return f"/view?{query}{fragment}"
+    return f"/asset?{query}"
+
+
+def collect_and_rewrite_tokens(tokens: list, base_dir: Path | None) -> tuple[str, list[tuple[int, str, str]]]:
+    heading_counts: dict[str, int] = {}
+    headings: list[tuple[int, str, str]] = []
+
+    def walk(token_list: list) -> None:
+        for index, token in enumerate(token_list):
+            if token.type == "heading_open":
+                inline_token = token_list[index + 1] if index + 1 < len(token_list) else None
+                inline_tokens = inline_token.children if inline_token and inline_token.type == "inline" else []
+                text = extract_inline_text(inline_tokens) or token.tag.upper()
+                slug = slugify(text)
+                if slug in heading_counts:
+                    heading_counts[slug] += 1
+                    slug = f"{slug}-{heading_counts[slug]}"
+                else:
+                    heading_counts[slug] = 0
+                token.attrSet("id", slug)
+                level = int(token.tag[1]) if len(token.tag) == 2 and token.tag.startswith("h") else 1
+                headings.append((level, text, slug))
+
+            if token.type == "inline" and token.children:
+                walk(token.children)
+                continue
+
+            if token.type == "link_open":
+                href = token.attrGet("href")
+                if href is not None:
+                    token.attrSet("href", rewrite_local_url(href, base_dir))
+                    token.attrSet("rel", "noreferrer")
+                    token.attrSet("target", "_blank" if urlsplit(href).scheme in {"http", "https"} else "_self")
+            elif token.type == "image":
+                src = token.attrGet("src")
+                if src is not None:
+                    token.attrSet("src", rewrite_local_url(src, base_dir, asset_mode=True))
+
+    walk(tokens)
+    title = next((text for level, text, _slug in headings if level == 1), headings[0][1] if headings else "Markdown Viewer")
+    return title, headings
+
+
+def build_toc_html(headings: list[tuple[int, str, str]]) -> str:
+    if not headings:
+        return '<p class="toc-empty">No headings found.</p>'
+
+    items = ["<ul class='toc-list'>"]
+    for level, text, anchor in headings:
+        items.append(f"<li class='toc-level-{level}'><a href='#{html.escape(anchor)}'>{html.escape(text)}</a></li>")
+    items.append("</ul>")
+    return "".join(items)
+
+
+def render_markdown(text: str, source_path: Path | None = None) -> RenderedPage:
+    parser = build_markdown_renderer()
+    tokens = parser.parse(text)
+    title, headings = collect_and_rewrite_tokens(tokens, source_path.parent if source_path else None)
+    content_html = parser.renderer.render(tokens, parser.options, {})
+    return RenderedPage(title=title, content_html=content_html, toc_html=build_toc_html(headings))
+
+
+def normalize_markdown_path(path_value: str, cwd_value: str | None = None) -> Path:
+    if not path_value or not path_value.strip():
+        raise ValueError("Path is required.")
+    try:
+        path = resolve_user_path(path_value, cwd_value)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Invalid path: {exc}") from exc
+
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"Path is not a file: {path}")
+    if path.suffix.lower() not in MARKDOWN_EXTENSIONS:
+        raise ValueError("Only .md and .markdown files are supported.")
+    return path
+
+
+def read_markdown_file(path_value: str, cwd_value: str | None = None) -> tuple[Path, str]:
+    path = normalize_markdown_path(path_value, cwd_value)
+    return path, path.read_text(encoding="utf-8")
+
+
+def render_home(error: str | None = None, cwd_hint: str | None = None) -> str:
+    return render_template_string(
+        HOME_TEMPLATE,
+        base_css=BASE_CSS,
+        error=error,
+        cwd_hint=str(normalize_base_dir(cwd_hint)),
+    )
+
+
+def render_document_page(
+    *,
+    page: RenderedPage,
+    source_name: str,
+    source_description: str,
+    source_path: str | None,
+    upload_mode: bool,
+    open_home_cwd: str | None = None,
+) -> str:
+    home_cwd = open_home_cwd or str(LAUNCH_CWD)
+    return render_template_string(
+        VIEW_TEMPLATE,
+        title=page.title,
+        base_css=BASE_CSS,
+        content_html=page.content_html,
+        toc_html=page.toc_html,
+        source_name=source_name,
+        source_description=source_description,
+        source_path=source_path,
+        reload_href=f"/view?{urlencode({'path': source_path})}" if source_path else None,
+        open_home_href=f"/?{urlencode({'cwd': home_cwd})}",
+        live_update=not upload_mode and bool(source_path),
+        upload_mode=upload_mode,
+        mtime_ns=page.mtime_ns or 0,
+    )
+
+
+@APP.route("/")
+def home() -> str:
+    return render_home(cwd_hint=request.args.get("cwd"))
+
+
+@APP.route("/health")
+def health() -> Response:
+    return jsonify(
+        {
+            "app": "mdview",
+            "host": SERVER_METADATA["host"],
+            "port": SERVER_METADATA["port"],
+            "pid": SERVER_METADATA["pid"],
+            "started_at": SERVER_METADATA["started_at"],
+        }
+    )
+
+
+@APP.route("/view")
+def view_markdown() -> tuple[str, int] | str:
+    path_value = request.args.get("path", "")
+    cwd_value = request.args.get("cwd")
+    try:
+        path, content = read_markdown_file(path_value, cwd_value)
+    except (ValueError, FileNotFoundError, PermissionError, UnicodeDecodeError) as exc:
+        return render_home(str(exc), cwd_hint=cwd_value), 400
+
+    page = render_markdown(content, path)
+    page.mtime_ns = path.stat().st_mtime_ns
+    return render_document_page(
+        page=page,
+        source_name=path.name,
+        source_description=str(path),
+        source_path=str(path),
+        upload_mode=False,
+        open_home_cwd=str(path.parent),
+    )
+
+
+@APP.route("/render-upload", methods=["POST"])
+def render_upload() -> tuple[str, int] | str:
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return render_home("Choose a Markdown file first."), 400
+    suffix = Path(uploaded.filename).suffix.lower()
+    if suffix not in MARKDOWN_EXTENSIONS:
+        return render_home("Only .md and .markdown files are supported."), 400
+    try:
+        text = uploaded.read().decode("utf-8")
+    except UnicodeDecodeError:
+        return render_home("Uploaded file must be valid UTF-8 Markdown."), 400
+
+    page = render_markdown(text, None)
+    return render_document_page(
+        page=page,
+        source_name=uploaded.filename,
+        source_description="Uploaded file rendered in memory.",
+        source_path=None,
+        upload_mode=True,
+    )
+
+
+@APP.route("/asset")
+def serve_asset() -> Response:
+    path_value = request.args.get("path", "")
+    try:
+        path = resolve_user_path(path_value)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return Response(str(exc), status=400, mimetype="text/plain")
+    if not path.exists() or not path.is_file():
+        return Response("Asset not found.", status=404, mimetype="text/plain")
+
+    mime_type = mimetypes.guess_type(path.name)[0]
+    return send_file(path, mimetype=mime_type)
+
+
+@APP.route("/meta")
+def meta() -> Response:
+    path_value = request.args.get("path", "")
+    try:
+        path = normalize_markdown_path(path_value)
+    except FileNotFoundError:
+        return jsonify({"exists": False}), 404
+    except (ValueError, PermissionError, UnicodeDecodeError) as exc:
+        return jsonify({"exists": False, "error": str(exc)}), 400
+
+    stat = path.stat()
+    return jsonify({"exists": True, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size})
+
+
+@APP.route("/fragment")
+def fragment() -> Response:
+    path_value = request.args.get("path", "")
+    try:
+        path, content = read_markdown_file(path_value)
+    except FileNotFoundError:
+        return jsonify({"error": "File not found."}), 404
+    except (ValueError, PermissionError, UnicodeDecodeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    page = render_markdown(content, path)
+    page.mtime_ns = path.stat().st_mtime_ns
+    return jsonify(
+        {
+            "title": page.title,
+            "content_html": page.content_html,
+            "toc_html": page.toc_html,
+            "mtime_ns": page.mtime_ns,
+        }
+    )
+
+
+def configure_server_logging() -> None:
+    APP.logger.disabled = True
+    logging.getLogger("werkzeug").disabled = True
+
+
+def is_connection_refused(error: urllib.error.URLError) -> bool:
+    reason = getattr(error, "reason", None)
+    if isinstance(reason, ConnectionRefusedError):
+        return True
+    if isinstance(reason, OSError) and getattr(reason, "errno", None) in {111, 61}:
+        return True
+    return False
+
+
+def read_process_cmdline(pid: int) -> list[str]:
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return []
+    return [part for part in raw.decode("utf-8", errors="ignore").split("\0") if part]
+
+
+def process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def find_listener_inodes(host: str, port: int) -> set[str]:
+    try:
+        packed_host = socket.inet_aton(host)
+    except OSError:
+        return set()
+
+    encoded_host = "".join(f"{byte:02X}" for byte in reversed(packed_host))
+    encoded_port = f"{port:04X}"
+    target = f"{encoded_host}:{encoded_port}"
+    inodes: set[str] = set()
+
+    try:
+        lines = Path("/proc/net/tcp").read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, PermissionError, OSError):
+        return set()
+
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        if parts[1] == target and parts[3] == "0A":
+            inodes.add(parts[9])
+    return inodes
+
+
+def find_listener_pids(host: str, port: int) -> list[int]:
+    inodes = find_listener_inodes(host, port)
+    if not inodes:
+        return []
+
+    pids: set[int] = set()
+    proc_root = Path("/proc")
+    for proc_entry in proc_root.iterdir():
+        if not proc_entry.name.isdigit():
+            continue
+        fd_dir = proc_entry / "fd"
+        try:
+            fd_entries = list(fd_dir.iterdir())
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+
+        for fd_entry in fd_entries:
+            try:
+                target = os.readlink(fd_entry)
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target.endswith("]"):
+                inode = target[8:-1]
+                if inode in inodes:
+                    pids.add(int(proc_entry.name))
+                    break
+    return sorted(pids)
+
+
+def matches_flag_value(cmdline: list[str], flag: str, expected: str) -> bool:
+    try:
+        index = cmdline.index(flag)
+    except ValueError:
+        return False
+    return index + 1 < len(cmdline) and cmdline[index + 1] == expected
+
+
+def is_mdview_serve_process(pid: int, host: str, port: int) -> bool:
+    cmdline = read_process_cmdline(pid)
+    if not cmdline:
+        return False
+
+    script_match = False
+    for candidate in (cmdline[0], cmdline[1] if len(cmdline) > 1 else ""):
+        if not candidate:
+            continue
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            if Path(candidate).resolve() == SCRIPT_PATH:
+                script_match = True
+                break
+
+    if not script_match:
+        return False
+    if "serve" not in cmdline:
+        return False
+    if not matches_flag_value(cmdline, "--host", host):
+        return False
+    if not matches_flag_value(cmdline, "--port", str(port)):
+        return False
+    return True
+
+
+def find_stale_mdview_pid(host: str, port: int, preferred_pid: int | None = None) -> int | None:
+    candidate_pids = find_listener_pids(host, port)
+    if preferred_pid is not None:
+        ordered = [preferred_pid] + [pid for pid in candidate_pids if pid != preferred_pid]
+    else:
+        ordered = candidate_pids
+
+    for pid in ordered:
+        if is_mdview_serve_process(pid, host, port):
+            return pid
+    return None
+
+
+def wait_for_pid_exit(pid: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not process_exists(pid):
+            return True
+        time.sleep(0.05)
+    return not process_exists(pid)
+
+
+def wait_for_port_release(host: str, port: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not find_listener_pids(host, port):
+            return True
+        time.sleep(0.05)
+    return not find_listener_pids(host, port)
+
+
+def terminate_mdview_process(pid: int, host: str, port: int) -> None:
+    if not is_mdview_serve_process(pid, host, port):
+        raise SystemExit(f"Refusing to terminate non-mdview process on {app_url(host, port)} (pid {pid}).")
+
+    if process_exists(pid):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+        if wait_for_pid_exit(pid, SERVER_STOP_TIMEOUT_SECONDS) and wait_for_port_release(host, port, 1.0):
+            return
+
+    if process_exists(pid):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        if wait_for_pid_exit(pid, 1.0) and wait_for_port_release(host, port, 1.0):
+            return
+
+    if not process_exists(pid) and wait_for_port_release(host, port, 1.0):
+        return
+    raise SystemExit(f"Failed to terminate stale mdview server on {app_url(host, port)} (pid {pid}).")
+
+
+def inspect_server_on_port(host: str, port: int, preferred_pid: int | None = None) -> ServerProbe:
+    probe = probe_server(port, host)
+    if probe.kind != "other":
+        return probe
+
+    stale_pid = find_stale_mdview_pid(host, port, preferred_pid)
+    if stale_pid is not None:
+        return ServerProbe(kind="stale", host=host, port=port, pid=stale_pid, detail=probe.detail)
+    return probe
+
+
+def probe_server(port: int, host: str = DEFAULT_HOST) -> ServerProbe:
+    request_url = f"{app_url(host, port)}/health"
+    req = urllib.request.Request(request_url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=HEALTH_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return ServerProbe(kind="other", host=host, port=port, detail=f"unexpected HTTP {exc.code}")
+    except urllib.error.URLError as exc:
+        if is_connection_refused(exc):
+            return ServerProbe(kind="none", host=host, port=port)
+        return ServerProbe(kind="other", host=host, port=port, detail=str(exc.reason))
+    except (TimeoutError, socket.timeout, json.JSONDecodeError, UnicodeDecodeError):
+        return ServerProbe(kind="other", host=host, port=port, detail="unexpected response")
+
+    if payload.get("app") != "mdview":
+        return ServerProbe(kind="other", host=host, port=port, detail="unexpected service")
+    return ServerProbe(
+        kind="mdview",
+        host=str(payload.get("host", host)),
+        port=int(payload.get("port", port)),
+        pid=int(payload.get("pid")) if payload.get("pid") is not None else None,
+        started_at=int(payload.get("started_at")) if payload.get("started_at") is not None else None,
+    )
+
+
+def adopt_probe_state(probe: ServerProbe) -> dict[str, object]:
+    state = build_state_payload(
+        host=probe.host,
+        port=probe.port,
+        pid=probe.pid or -1,
+        started_at=probe.started_at or int(time.time()),
+    )
+    write_state_file(state)
+    return state
+
+
+def get_running_server(requested_port: int, port_was_explicit: bool) -> dict[str, object] | None:
+    state = read_state_file()
+    if state:
+        state_host = str(state.get("host", DEFAULT_HOST))
+        state_port = int(state.get("port", DEFAULT_PORT))
+        preferred_pid = int(state.get("pid", -1))
+        probe = inspect_server_on_port(state_host, state_port, preferred_pid if preferred_pid > 0 else None)
+        if probe.kind == "mdview":
+            if port_was_explicit and requested_port != state_port:
+                raise SystemExit(
+                    f"mdview server is already running on port {state_port}. Stop it before using --port {requested_port}."
+                )
+            fresh_state = build_state_payload(
+                host=probe.host,
+                port=probe.port,
+                pid=probe.pid or int(state.get("pid", -1)),
+                started_at=probe.started_at or int(state.get("started_at", int(time.time()))),
+            )
+            write_state_file(fresh_state)
+            return fresh_state
+        if probe.kind == "stale" and probe.pid is not None:
+            terminate_mdview_process(probe.pid, state_host, state_port)
+        remove_state_file()
+
+    probe = inspect_server_on_port(DEFAULT_HOST, requested_port)
+    if probe.kind == "mdview":
+        return adopt_probe_state(probe)
+    if probe.kind == "stale" and probe.pid is not None:
+        terminate_mdview_process(probe.pid, DEFAULT_HOST, requested_port)
+        remove_state_file()
+        return None
+    if probe.kind == "other":
+        raise SystemExit(f"Port {requested_port} is already in use by another service.")
+    return None
+
+
+def start_server_process(port: int, host: str = DEFAULT_HOST) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [sys.executable, str(SCRIPT_PATH), "serve", "--host", host, "--port", str(port)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=str(LAUNCH_CWD),
+        close_fds=True,
+        start_new_session=True,
+    )
+
+
+def wait_for_server_ready(port: int, process: subprocess.Popen[bytes], host: str = DEFAULT_HOST) -> dict[str, object]:
+    deadline = time.monotonic() + SERVER_START_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        probe = probe_server(port, host)
+        if probe.kind == "mdview":
+            return adopt_probe_state(probe)
+        if probe.kind == "other":
+            raise SystemExit(f"Port {port} is already in use by another service.")
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    raise SystemExit(f"Failed to start mdview server on port {port}.")
+
+
+def ensure_server_running(requested_port: int, port_was_explicit: bool) -> dict[str, object]:
+    running = get_running_server(requested_port, port_was_explicit)
+    if running:
+        return running
+    process = start_server_process(requested_port, DEFAULT_HOST)
+    return wait_for_server_ready(requested_port, process, DEFAULT_HOST)
+
+
+def find_server_for_lifecycle() -> dict[str, object] | None:
+    state = read_state_file()
+    if state:
+        state_host = str(state.get("host", DEFAULT_HOST))
+        state_port = int(state.get("port", DEFAULT_PORT))
+        preferred_pid = int(state.get("pid", -1))
+        probe = inspect_server_on_port(state_host, state_port, preferred_pid if preferred_pid > 0 else None)
+        if probe.kind == "mdview":
+            fresh_state = build_state_payload(
+                host=probe.host,
+                port=probe.port,
+                pid=probe.pid or int(state.get("pid", -1)),
+                started_at=probe.started_at or int(state.get("started_at", int(time.time()))),
+            )
+            write_state_file(fresh_state)
+            return fresh_state
+        if probe.kind == "stale":
+            stale_state = build_state_payload(
+                host=probe.host,
+                port=probe.port,
+                pid=probe.pid or preferred_pid,
+                started_at=int(state.get("started_at", int(time.time()))),
+            )
+            stale_state["status"] = "stale"
+            write_state_file(stale_state)
+            return stale_state
+        remove_state_file()
+
+    probe = inspect_server_on_port(DEFAULT_HOST, DEFAULT_PORT)
+    if probe.kind == "mdview":
+        return adopt_probe_state(probe)
+    if probe.kind == "stale":
+        stale_state = build_state_payload(
+            host=probe.host,
+            port=probe.port,
+            pid=probe.pid or -1,
+            started_at=int(time.time()),
+        )
+        stale_state["status"] = "stale"
+        write_state_file(stale_state)
+        return stale_state
+    return None
+
+
+def open_target_url(path_value: str | None, port: int, no_open: bool, port_was_explicit: bool) -> int:
+    resolved_path: str | None = None
+    if path_value:
+        resolved_path = str(normalize_markdown_path(path_value))
+
+    server = ensure_server_running(port, port_was_explicit=port_was_explicit)
+    target_port = int(server["port"])
+    if resolved_path:
+        target_url = f"{app_url(DEFAULT_HOST, target_port)}/view?{urlencode({'path': resolved_path})}"
+    else:
+        target_url = f"{app_url(DEFAULT_HOST, target_port)}/?{urlencode({'cwd': str(LAUNCH_CWD)})}"
+    if not no_open:
+        webbrowser.open(target_url, new=2)
+    return 0
+
+
+def print_status() -> int:
+    server = find_server_for_lifecycle()
+    if not server:
+        print("mdview server is not running.")
+        print(f"state: {state_dir_url()}")
+        return 1
+
+    status = str(server.get("status", "running"))
+    if status == "stale":
+        print("mdview server is stale.")
+    else:
+        print("mdview server is running.")
+    print(f"url: {app_url(str(server['host']), int(server['port']))}")
+    print(f"pid: {int(server['pid'])}")
+    print(f"state: {state_dir_url()}")
+    return 0 if status == "running" else 1
+
+
+def stop_server() -> int:
+    server = find_server_for_lifecycle()
+    if not server:
+        print("mdview server is not running.")
+        print(f"state: {state_dir_url()}")
+        return 0
+
+    pid = int(server["pid"])
+    host = str(server["host"])
+    port = int(server["port"])
+    terminate_mdview_process(pid, host, port)
+    remove_state_file()
+    print(f"Stopped mdview server on {app_url(host, port)} (pid {pid}).")
+    return 0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+
+    if raw_args and raw_args[0] == "serve":
+        parser = argparse.ArgumentParser(description="Run the mdview server.")
+        parser.add_argument("command")
+        parser.add_argument("--host", default=DEFAULT_HOST)
+        parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+        return parser.parse_args(raw_args)
+
+    if raw_args and raw_args[0] == "status":
+        parser = argparse.ArgumentParser(description="Show mdview server status.")
+        parser.add_argument("command")
+        return parser.parse_args(raw_args)
+
+    if raw_args and raw_args[0] == "stop":
+        parser = argparse.ArgumentParser(description="Stop the mdview server.")
+        parser.add_argument("command")
+        return parser.parse_args(raw_args)
+
+    parser = argparse.ArgumentParser(description="View a local Markdown file in the browser.")
+    parser.add_argument("path", nargs="?", help="Path to a .md or .markdown file.")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port to bind to. Default: {DEFAULT_PORT}.")
+    parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically.")
+    parsed = parser.parse_args(raw_args)
+    parsed.command = "open"
+    parsed.port_explicit = "--port" in raw_args
+    return parsed
+
+
+def run_server(host: str, port: int) -> int:
+    configure_server_logging()
+    SERVER_METADATA.update({"host": host, "port": port, "pid": os.getpid(), "started_at": int(time.time())})
+
+    try:
+        server = make_server(host, port, APP, threaded=True, request_handler=QuietRequestHandler)
+    except OSError as exc:
+        raise SystemExit(f"Failed to bind {host}:{port}: {exc}") from exc
+
+    write_state_file(
+        build_state_payload(
+            host=host,
+            port=port,
+            pid=int(SERVER_METADATA["pid"]),
+            started_at=int(SERVER_METADATA["started_at"]),
+        )
+    )
+
+    def stop_handler(_signum: int, _frame: object) -> None:
+        shutdown_thread = threading.Thread(target=server.shutdown, daemon=True)
+        shutdown_thread.start()
+
+    signal.signal(signal.SIGTERM, stop_handler)
+    signal.signal(signal.SIGINT, stop_handler)
+
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        remove_state_if_pid_matches(os.getpid())
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.command == "serve":
+        return run_server(args.host, args.port)
+    if args.command == "status":
+        return print_status()
+    if args.command == "stop":
+        return stop_server()
+    return open_target_url(args.path, args.port, args.no_open, args.port_explicit)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
