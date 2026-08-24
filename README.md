@@ -1,25 +1,42 @@
 # configs
 
-Личные конфиги для:
+Переносимый комплект моих конфигов для Ubuntu 24.04:
 
-- `nvim`
-- `kitty`
-- `IdeaVim`
-- `mdview`
+- Neovim;
+- Kitty;
+- локальный Markdown viewer `mdview`;
+- `.ideavimrc` (не устанавливается автоматически).
 
-Структура репозитория повторяет расположение файлов в домашней директории:
+В Git лежит только то, что нельзя просто скачать заново: конфиги, plugin
+lockfile, скрипт `mdview` и bootstrap-скрипты. Архивов Nvim, Kitty, шрифтов,
+плагинов, LSP и Tree-sitter parsers в репозитории нет.
 
-- `.config/nvim`
-- `.config/kitty`
-- `.ideavimrc`
-- `bin/mdview`
+## Быстрая установка на новом host
 
-Пример подключения:
+Внимание: команда ниже намеренно удаляет старые пользовательские конфиги и
+runtime-каталоги Nvim/Kitty. Она не удаляет проекты, SSH-ключи, Git-настройки
+или системные пакеты.
 
 ```bash
-ln -sfn ~/configs/.config/nvim ~/.config/nvim
-ln -sfn ~/configs/.config/kitty ~/.config/kitty
-ln -sfn ~/configs/.ideavimrc ~/.ideavimrc
-ln -sfn ~/configs/bin/mdview ~/bin/mdview
-python3 -m pip install --user -r ~/configs/requirements/mdview.txt
+git clone https://github.com/darik-cell/configs.git ~/configs
+cd ~/configs
+./install.sh --check
+./install.sh
+```
+
+Скрипт сначала покажет точный список удаляемых путей и попросит подтверждение.
+Для автономного запуска после проверки host:
+
+```bash
+./install.sh --yes
+```
+
+Если не хватает Ubuntu-пакетов, скрипт ничего не удалит, а напечатает готовую
+`apt-get` команду. Подробный сценарий для агента: [AGENT_INSTALL.md](AGENT_INSTALL.md).
+
+Повторная проверка:
+
+```bash
+cd ~/configs
+./verify.sh
 ```
