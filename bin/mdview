@@ -43,6 +43,28 @@ SERVER_STOP_TIMEOUT_SECONDS = 3.0
 STATE_VERSION = 1
 MARKDOWN_EXTENSIONS = {".md", ".markdown"}
 ALLOWED_LINK_SCHEMES = {"http", "https", "mailto", "tel"}
+CODE_LANGUAGE_LABELS = {
+    "bash": "Bash",
+    "css": "CSS",
+    "html": "HTML",
+    "java": "Java",
+    "javascript": "JavaScript",
+    "js": "JavaScript",
+    "json": "JSON",
+    "kotlin": "Kotlin",
+    "kt": "Kotlin",
+    "python": "Python",
+    "py": "Python",
+    "shell": "Shell",
+    "sh": "Shell",
+    "sql": "SQL",
+    "text": "Text",
+    "ts": "TypeScript",
+    "typescript": "TypeScript",
+    "xml": "XML",
+    "yaml": "YAML",
+    "yml": "YAML",
+}
 APP = Flask(__name__)
 APP.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 LAUNCH_CWD = Path.cwd()
@@ -195,7 +217,7 @@ VIEW_TEMPLATE = """<!doctype html>
 
   <main class="viewer-grid">
     <article id="content" class="markdown-body">{{ content_html|safe }}</article>
-    <aside class="toc-card">
+    <aside id="toc-card" class="toc-card"{% if not has_toc %} hidden{% endif %}>
       <h2>Contents</h2>
       <div id="toc">{{ toc_html|safe }}</div>
     </aside>
@@ -205,7 +227,10 @@ VIEW_TEMPLATE = """<!doctype html>
 
   <script>
     const copyToast = document.getElementById("copy-toast");
+    const tocCard = document.getElementById("toc-card");
     let copyToastTimer = null;
+    const tocBranchState = new Map();
+    let tocNavigationCleanup = null;
 
     function showCopyToast(message, kind = "success") {
       if (!copyToast) {
@@ -248,14 +273,8 @@ VIEW_TEMPLATE = """<!doctype html>
       return ok;
     }
 
-    document.addEventListener("click", async (event) => {
-      const link = event.target.closest(".copy-link");
-      if (!link) {
-        return;
-      }
-
-      event.preventDefault();
-      const encoded = link.dataset.copyB64;
+    async function copyFromTarget(target) {
+      const encoded = target.dataset.copyB64;
       if (!encoded) {
         showCopyToast("Copy failed", "error");
         return;
@@ -283,7 +302,180 @@ VIEW_TEMPLATE = """<!doctype html>
           showCopyToast("Copy failed", "error");
         }
       }
+    }
+
+    document.addEventListener("click", async (event) => {
+      const target = event.target.closest("[data-copy-b64]");
+      if (!target) {
+        return;
+      }
+
+      if (target.classList.contains("copy-inline")) {
+        const selection = window.getSelection();
+        if (selection && !selection.isCollapsed) {
+          return;
+        }
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      await copyFromTarget(target);
     });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") {
+        return;
+      }
+      const target = event.target.closest(".copy-inline[data-copy-b64]");
+      if (!target) {
+        return;
+      }
+      event.preventDefault();
+      target.click();
+    });
+
+    function setTocBranchExpanded(item, expanded) {
+      const toggle = item.querySelector(":scope > .toc-row > .toc-toggle");
+      const children = item.querySelector(":scope > .toc-children");
+      if (!toggle || !children) {
+        return;
+      }
+      toggle.setAttribute("aria-expanded", String(expanded));
+      toggle.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} ${item.dataset.tocText || "section"}`);
+      children.hidden = !expanded;
+      item.classList.toggle("is-expanded", expanded);
+    }
+
+    function initializeTocNavigation() {
+      if (tocNavigationCleanup) {
+        tocNavigationCleanup();
+        tocNavigationCleanup = null;
+      }
+
+      const toc = document.getElementById("toc");
+      const content = document.getElementById("content");
+      if (!toc || !content) {
+        return;
+      }
+
+      const headings = Array.from(content.querySelectorAll("h1[id], h2[id], h3[id], h4[id], h5[id], h6[id]"));
+      const links = new Map(
+        Array.from(toc.querySelectorAll(".toc-link[href^='#']")).map((link) => [
+          decodeURIComponent(link.hash.slice(1)),
+          link
+        ])
+      );
+      const branchItems = Array.from(toc.querySelectorAll(".toc-item.has-children"));
+      let lastActiveId = null;
+      let scrollScheduled = false;
+
+      branchItems.forEach((item) => setTocBranchExpanded(item, tocBranchState.get(item.dataset.anchor) === true));
+
+      function activeHeading() {
+        if (!headings.length) {
+          return null;
+        }
+        const threshold = Math.min(160, window.innerHeight * 0.2);
+        let active = headings[0];
+        for (const heading of headings) {
+          if (heading.getBoundingClientRect().top > threshold) {
+            break;
+          }
+          active = heading;
+        }
+        if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) {
+          active = headings[headings.length - 1];
+        }
+        return active;
+      }
+
+      function revealActiveBranch(activeItem) {
+        branchItems.forEach((item) => {
+          setTocBranchExpanded(item, tocBranchState.get(item.dataset.anchor) === true);
+        });
+
+        let item = activeItem;
+        while (item && item.matches(".toc-item")) {
+          if (item.classList.contains("has-children")) {
+            setTocBranchExpanded(item, true);
+          }
+          const parentList = item.parentElement;
+          item = parentList ? parentList.closest(".toc-item") : null;
+        }
+      }
+
+      function keepTocLinkVisible(link) {
+        if (!tocCard || tocCard.scrollHeight <= tocCard.clientHeight) {
+          return;
+        }
+        const cardRect = tocCard.getBoundingClientRect();
+        const linkRect = link.getBoundingClientRect();
+        const edgePadding = 8;
+        if (linkRect.top < cardRect.top + edgePadding) {
+          tocCard.scrollTop += linkRect.top - cardRect.top - edgePadding;
+        } else if (linkRect.bottom > cardRect.bottom - edgePadding) {
+          tocCard.scrollTop += linkRect.bottom - cardRect.bottom + edgePadding;
+        }
+      }
+
+      function updateActiveHeading() {
+        scrollScheduled = false;
+        const heading = activeHeading();
+        const activeId = heading ? heading.id : null;
+        if (activeId === lastActiveId) {
+          return;
+        }
+        lastActiveId = activeId;
+
+        links.forEach((link) => {
+          link.classList.remove("is-active");
+          link.removeAttribute("aria-current");
+        });
+
+        const link = activeId ? links.get(activeId) : null;
+        if (!link) {
+          return;
+        }
+        link.classList.add("is-active");
+        link.setAttribute("aria-current", "location");
+        revealActiveBranch(link.closest(".toc-item"));
+        keepTocLinkVisible(link);
+      }
+
+      function scheduleActiveUpdate() {
+        if (scrollScheduled) {
+          return;
+        }
+        scrollScheduled = true;
+        window.requestAnimationFrame(updateActiveHeading);
+      }
+
+      function onTocClick(event) {
+        const toggle = event.target.closest(".toc-toggle");
+        if (!toggle || !toc.contains(toggle)) {
+          return;
+        }
+        const item = toggle.closest(".toc-item");
+        const expanded = toggle.getAttribute("aria-expanded") === "true";
+        tocBranchState.set(item.dataset.anchor, !expanded);
+        setTocBranchExpanded(item, !expanded);
+      }
+
+      toc.addEventListener("click", onTocClick);
+      window.addEventListener("scroll", scheduleActiveUpdate, { passive: true });
+      window.addEventListener("resize", scheduleActiveUpdate);
+      window.addEventListener("hashchange", scheduleActiveUpdate);
+      updateActiveHeading();
+
+      tocNavigationCleanup = () => {
+        toc.removeEventListener("click", onTocClick);
+        window.removeEventListener("scroll", scheduleActiveUpdate);
+        window.removeEventListener("resize", scheduleActiveUpdate);
+        window.removeEventListener("hashchange", scheduleActiveUpdate);
+      };
+    }
+
+    initializeTocNavigation();
   </script>
 
   {% if source_path and live_update %}
@@ -329,8 +521,10 @@ VIEW_TEMPLATE = """<!doctype html>
           const fragment = await fragmentResponse.json();
           contentNode.innerHTML = fragment.content_html;
           tocNode.innerHTML = fragment.toc_html;
+          tocCard.hidden = !fragment.has_toc;
           document.title = fragment.title;
           lastMtime = fragment.mtime_ns;
+          initializeTocNavigation();
           setStatus("Updated automatically.", "updated");
         } else {
           setStatus("Watching for changes.", "idle");
@@ -358,46 +552,71 @@ VIEW_TEMPLATE = """<!doctype html>
 BASE_CSS = f"""
 :root {{
   color-scheme: light;
-  --bg: #f3efe7;
-  --paper: #fffdf8;
-  --text: #2a241d;
-  --muted: #70665a;
-  --border: #d8cbb7;
-  --accent: #9d4e2f;
-  --accent-soft: #f3dfcf;
-  --code-bg: #f5efe6;
-  --error: #9d2f2f;
-  --success: #2f7a42;
-  --shadow: 0 18px 48px rgba(85, 59, 31, 0.12);
+  --bg: #fcfcfc;
+  --paper: #ffffff;
+  --text: #0d0d0d;
+  --muted: #676767;
+  --border: #e5e5e5;
+  --accent: #0d0d0d;
+  --accent-soft: #f2f2f2;
+  --code-bg: #f3f3f3;
+  --inline-code-bg: #ececec;
+  --error: #b42318;
+  --success: #247a3c;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
 }}
 
 * {{
   box-sizing: border-box;
 }}
 
-body {{
-  margin: 0;
-  font-family: "Iosevka Etoile", "IBM Plex Sans", "Segoe UI", sans-serif;
-  background:
-    radial-gradient(circle at top right, rgba(157, 78, 47, 0.12), transparent 24rem),
-    linear-gradient(180deg, #f8f3ea 0%, var(--bg) 100%);
-  color: var(--text);
+[hidden] {{
+  display: none !important;
 }}
 
-code, pre {{
-  font-family: "Iosevka Term", "JetBrains Mono", monospace;
+html {{
+  background: var(--bg);
+}}
+
+body {{
+  margin: 0;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}}
+
+code,
+pre {{
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }}
 
 a {{
   color: var(--accent);
 }}
 
+button {{
+  font: inherit;
+}}
+
+.sr-only {{
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}}
+
 .home-shell,
-.viewer-grid,
 .topbar,
 .status-banner {{
-  width: min(1180px, calc(100vw - 2rem));
-  margin: 0 auto;
+  width: min(1120px, calc(100vw - 2rem));
+  margin-right: auto;
+  margin-left: auto;
 }}
 
 .home-shell {{
@@ -407,34 +626,32 @@ a {{
   padding: 2rem 0;
 }}
 
-.card,
-.toc-card,
-.markdown-body,
-.status-banner,
-.topbar {{
-  background: rgba(255, 253, 248, 0.92);
-  backdrop-filter: blur(8px);
-  border: 1px solid rgba(216, 203, 183, 0.8);
+.card {{
+  width: min(720px, 100%);
+  padding: 2rem;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--paper);
   box-shadow: var(--shadow);
 }}
 
-.card {{
-  width: min(760px, 100%);
-  padding: 2rem;
-  border-radius: 24px;
-}}
-
 .eyebrow {{
-  margin: 0 0 0.5rem;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  font-size: 0.78rem;
+  margin: 0 0 0.45rem;
   color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
 }}
 
-h1, h2, h3, h4, h5, h6 {{
-  font-family: "IBM Plex Serif", "Georgia", serif;
-  line-height: 1.15;
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {{
+  font-family: inherit;
+  line-height: 1.25;
 }}
 
 .lead,
@@ -457,34 +674,52 @@ label {{
 
 input[type="text"] {{
   flex: 1 1 24rem;
-  padding: 0.9rem 1rem;
-  border-radius: 14px;
+  padding: 0.85rem 1rem;
   border: 1px solid var(--border);
+  border-radius: 12px;
   background: var(--paper);
   color: var(--text);
   font-size: 1rem;
 }}
 
-button,
+input[type="text"]:focus-visible {{
+  border-color: #a3a3a3;
+  outline: 2px solid rgba(13, 13, 13, 0.12);
+  outline-offset: 1px;
+}}
+
+.path-form button,
+.upload-form button,
 .action-link {{
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 0.4rem;
-  padding: 0.85rem 1.1rem;
+  min-height: 2.5rem;
+  padding: 0.65rem 1rem;
+  border: 1px solid var(--accent);
   border-radius: 999px;
-  border: 1px solid transparent;
   background: var(--accent);
-  color: #fffaf4;
+  color: #ffffff;
   cursor: pointer;
   text-decoration: none;
   font-weight: 600;
 }}
 
-.secondary-button {{
-  background: transparent;
-  color: var(--accent);
+.path-form button:hover,
+.upload-form button:hover,
+.action-link:hover {{
+  background: #2f2f2f;
+}}
+
+.upload-form .secondary-button {{
   border-color: var(--border);
+  background: var(--paper);
+  color: var(--text);
+}}
+
+.upload-form .secondary-button:hover {{
+  background: var(--accent-soft);
 }}
 
 .path-form,
@@ -500,14 +735,14 @@ button,
 }}
 
 .drop-zone {{
-  margin-top: 1.4rem;
-  padding: 1.8rem;
-  border: 2px dashed var(--border);
-  border-radius: 20px;
-  background: linear-gradient(180deg, rgba(243, 223, 207, 0.58), rgba(255, 253, 248, 0.6));
-  cursor: pointer;
   display: grid;
   gap: 0.35rem;
+  margin-top: 1.4rem;
+  padding: 1.8rem;
+  border: 1px dashed #b4b4b4;
+  border-radius: 16px;
+  background: #fafafa;
+  cursor: pointer;
 }}
 
 .drop-zone.dragged {{
@@ -517,159 +752,283 @@ button,
 
 .flash,
 .status-banner {{
-  border-radius: 16px;
-  padding: 0.95rem 1rem;
-  margin-top: 1rem;
+  margin-top: 0.75rem;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--paper);
+  color: var(--muted);
+  font-size: 0.875rem;
+  box-shadow: var(--shadow);
 }}
 
 .flash-error,
 .status-banner[data-kind="error"] {{
+  border-color: rgba(180, 35, 24, 0.2);
+  background: #fff6f5;
   color: var(--error);
-  border: 1px solid rgba(157, 47, 47, 0.18);
-  background: rgba(157, 47, 47, 0.08);
 }}
 
 .status-banner[data-kind="updated"] {{
+  border-color: rgba(36, 122, 60, 0.2);
+  background: #f4fbf6;
   color: var(--success);
-  border: 1px solid rgba(47, 122, 66, 0.18);
-  background: rgba(47, 122, 66, 0.08);
 }}
 
 .status-banner[data-kind="refreshing"] {{
-  border: 1px solid rgba(157, 78, 47, 0.2);
-  background: rgba(157, 78, 47, 0.08);
+  background: var(--accent-soft);
+  color: var(--text);
 }}
 
 .viewer-page {{
-  padding-bottom: 2rem;
+  min-height: 100vh;
+  padding-bottom: 4rem;
 }}
 
 .topbar {{
-  margin-top: 1rem;
-  padding: 1.25rem 1.5rem;
-  border-radius: 24px;
   display: flex;
   justify-content: space-between;
   gap: 1rem;
   align-items: flex-start;
+  margin-top: 1rem;
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--paper);
+  box-shadow: var(--shadow);
 }}
 
 .topbar h1 {{
   margin: 0;
-  font-size: clamp(1.5rem, 1.3rem + 1vw, 2.2rem);
+  font-size: clamp(1.35rem, 1.2rem + 0.6vw, 1.8rem);
 }}
 
 .topbar .subtitle {{
-  margin-bottom: 0;
+  margin: 0.45rem 0 0;
+  font-size: 0.875rem;
   word-break: break-all;
 }}
 
 .topbar-actions {{
   display: flex;
-  gap: 0.75rem;
+  gap: 0.6rem;
   flex-wrap: wrap;
 }}
 
 .viewer-grid {{
-  margin-top: 1rem;
+  width: calc(100vw - 2rem);
+  margin: 0 auto;
   display: grid;
-  grid-template-columns: minmax(0, 3fr) minmax(260px, 1fr);
-  gap: 1rem;
+  grid-template-columns: minmax(220px, 1fr) minmax(0, 48rem) minmax(220px, 1fr);
+  gap: 1.5rem;
   align-items: start;
 }}
 
-.markdown-body,
-.toc-card {{
-  border-radius: 24px;
+.markdown-body {{
+  grid-column: 2;
+  min-width: 0;
+  padding: 2.5rem 0 4rem;
+  overflow-wrap: anywhere;
+  font-size: 1rem;
+  line-height: 1.75;
 }}
 
-.markdown-body {{
-  padding: 2rem;
-  overflow-wrap: anywhere;
+.markdown-body > :first-child {{
+  margin-top: 0;
 }}
+
+.markdown-body > :last-child {{
+  margin-bottom: 0;
+}}
+
+.markdown-body p {{
+  margin: 0 0 1.5rem;
+}}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {{
+  margin: 2rem 0 0.8rem;
+  scroll-margin-top: 1.5rem;
+  letter-spacing: -0.015em;
+}}
+
+.markdown-body h1 {{ font-size: 2rem; }}
+.markdown-body h2 {{ font-size: 1.5rem; }}
+.markdown-body h3 {{ font-size: 1.25rem; }}
 
 .inline-code-wrap {{
   position: relative;
   display: inline-block;
 }}
 
+.copy-inline {{
+  cursor: copy;
+}}
+
+.copy-inline:focus-visible {{
+  border-radius: 6px;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}}
+
 .markdown-body img {{
   max-width: 100%;
   height: auto;
+  border-radius: 12px;
 }}
 
 .markdown-body ul,
 .markdown-body ol {{
-  padding-left: 1.45rem;
+  margin: 0 0 1.5rem;
+  padding-left: 1.6rem;
 }}
 
 .markdown-body ul:not(.contains-task-list) > li + li,
 .markdown-body ol > li + li {{
-  margin-top: 0.42rem;
-}}
-
-.markdown-body pre {{
-  overflow-x: auto;
-  padding: 1rem;
-  background: var(--code-bg);
-  border-radius: 16px;
-  border: 1px solid rgba(216, 203, 183, 0.7);
+  margin-top: 0.45rem;
 }}
 
 .markdown-body :not(pre) > code {{
-  padding: 0.18rem 0.4rem;
-  border-radius: 0.45rem;
-  background: var(--code-bg);
-  border: 1px solid rgba(216, 203, 183, 0.6);
-  font-size: 0.92em;
-}}
-
-.copy-link {{
-  display: block;
-  text-decoration: none;
-  color: transparent;
-  background: transparent;
+  padding: 0.15rem 0.35rem;
   border: 0;
-  opacity: 0.01;
-  z-index: 3;
-}}
-
-.copy-link-inline {{
-  position: absolute;
-  inset: 0;
+  border-radius: 6px;
+  background: var(--inline-code-bg);
+  font-size: 0.9em;
 }}
 
 .code-block-wrap {{
-  position: relative;
+  min-width: 0;
+  margin: 1.5rem 0 2rem;
+  overflow: hidden;
+  border-radius: 24px;
+  background: var(--code-bg);
 }}
 
-.copy-link-block {{
-  position: sticky;
-  top: 1rem;
-  float: right;
-  width: 1.3rem;
-  height: 1.3rem;
-  margin: 0.6rem 0.6rem -1.9rem 0;
+.code-block-header {{
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--inline-code-bg);
+}}
+
+.code-language {{
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+}}
+
+.code-block-icon,
+.copy-icon {{
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+}}
+
+.code-block-wrap .highlight {{
+  min-width: 0;
+  background: transparent;
+}}
+
+.markdown-body .code-block-wrap pre {{
+  margin: 0;
+  padding: 14px 20px 22px;
+  overflow-x: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.9rem;
+  font-variant-ligatures: none;
+  line-height: 1.55;
+  tab-size: 4;
+  white-space: pre;
+}}
+
+.copy-control {{
+  display: inline-flex;
+  min-height: 2rem;
+  align-items: center;
+  justify-content: center;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 600;
+}}
+
+.copy-control:hover {{
+  background: #e8e8e8;
+}}
+
+.copy-control:focus-visible {{
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}}
+
+.copy-control-block {{
+  position: static;
+  width: 36px;
+  height: 36px;
+  min-height: 0;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+}}
+
+.table-wrap {{
+  position: relative;
+  margin: 1.5rem 0;
+  padding-top: 2.8rem;
+}}
+
+.copy-control-table {{
+  position: absolute;
+  top: 0.35rem;
+  right: 0;
+  z-index: 3;
+}}
+
+.table-scroll {{
+  overflow-x: auto;
+}}
+
+.markdown-body .table-wrap table {{
+  margin: 0;
 }}
 
 .copy-toast {{
   position: fixed;
   top: 1rem;
   right: 1rem;
-  padding: 0.7rem 0.95rem;
+  z-index: 20;
+  padding: 0.65rem 0.9rem;
   border-radius: 999px;
-  color: #fffaf4;
-  background: rgba(42, 36, 29, 0.92);
-  box-shadow: var(--shadow);
+  background: rgba(13, 13, 13, 0.92);
+  color: #ffffff;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
   opacity: 0;
   pointer-events: none;
   transform: translateY(-0.4rem);
   transition: opacity 120ms ease, transform 120ms ease;
-  z-index: 20;
 }}
 
 .copy-toast[data-kind="error"] {{
-  background: rgba(157, 47, 47, 0.94);
+  background: rgba(180, 35, 24, 0.94);
 }}
 
 .copy-toast.visible {{
@@ -678,34 +1037,32 @@ button,
 }}
 
 .markdown-body blockquote {{
-  margin: 1.25rem 0;
-  padding: 0.25rem 1rem;
-  border-left: 4px solid var(--accent);
+  margin: 1.5rem 0;
+  padding: 0.15rem 1rem;
+  border-left: 3px solid #b4b4b4;
   color: var(--muted);
-  background: rgba(243, 223, 207, 0.28);
-  border-radius: 0 16px 16px 0;
 }}
 
 .markdown-body table {{
   width: 100%;
+  margin: 1.5rem 0;
   border-collapse: collapse;
-  margin: 1.25rem 0;
 }}
 
 .markdown-body th,
 .markdown-body td {{
-  border: 1px solid var(--border);
   padding: 0.7rem 0.8rem;
+  border: 1px solid var(--border);
   text-align: left;
 }}
 
 .markdown-body th {{
-  background: rgba(243, 223, 207, 0.4);
+  background: #f7f7f7;
 }}
 
 .markdown-body ul.contains-task-list {{
-  list-style: none;
   padding-left: 0;
+  list-style: none;
 }}
 
 .markdown-body .task-list-item {{
@@ -715,40 +1072,112 @@ button,
 }}
 
 .toc-card {{
+  grid-column: 3;
+  justify-self: end;
+  width: min(280px, 100%);
+  min-width: 0;
+  max-height: calc(100vh - 2rem);
   position: sticky;
   top: 1rem;
-  padding: 1.35rem;
+  margin-top: 2.5rem;
+  padding: 1rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--paper);
+  box-shadow: var(--shadow);
 }}
 
 .toc-card h2 {{
-  margin-top: 0;
-  margin-bottom: 0.8rem;
-  font-size: 1rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  margin: 0 0 0.75rem;
   color: var(--muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }}
 
-.toc-list {{
-  list-style: none;
-  padding: 0;
+.toc-list,
+.toc-children {{
   margin: 0;
+  padding: 0;
+  list-style: none;
+}}
+
+.toc-item + .toc-item {{
+  margin-top: 0.3rem;
+}}
+
+.toc-row {{
   display: grid;
-  gap: 0.35rem;
+  grid-template-columns: 1.35rem minmax(0, 1fr);
+  align-items: start;
+  gap: 0.25rem;
+  min-width: 0;
 }}
 
-.toc-list a {{
+.toc-toggle,
+.toc-toggle-spacer {{
+  width: 1.35rem;
+  height: 1.6rem;
+}}
+
+.toc-toggle {{
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}}
+
+.toc-toggle:hover,
+.toc-toggle:focus-visible {{
+  background: var(--accent-soft);
+  color: var(--accent);
+}}
+
+.toc-toggle::before {{
+  content: "›";
+  font-size: 1.15rem;
+  line-height: 1;
+  transition: transform 120ms ease;
+}}
+
+.toc-toggle[aria-expanded="true"]::before {{
+  transform: rotate(90deg);
+}}
+
+.toc-link {{
   display: block;
-  text-decoration: none;
+  min-width: 0;
+  padding: 0.22rem 0.35rem;
+  border-radius: 6px;
   color: var(--text);
-  padding: 0.2rem 0;
+  font-size: 0.875rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+  white-space: normal;
 }}
 
-.toc-level-2 {{ padding-left: 0.6rem; }}
-.toc-level-3 {{ padding-left: 1.1rem; }}
-.toc-level-4 {{ padding-left: 1.5rem; }}
-.toc-level-5 {{ padding-left: 1.9rem; }}
-.toc-level-6 {{ padding-left: 2.3rem; }}
+.toc-link:hover,
+.toc-link.is-active {{
+  background: var(--accent-soft);
+}}
+
+.toc-link.is-active {{
+  font-weight: 600;
+}}
+
+.toc-children {{
+  margin: 0.25rem 0 0.15rem 0.67rem;
+  padding-left: 0.67rem;
+  border-left: 1px solid var(--border);
+}}
 
 .toc-empty {{
   color: var(--muted);
@@ -756,33 +1185,139 @@ button,
 
 {PYGMENTS_CSS}
 
-@media (max-width: 920px) {{
+.highlight {{
+  background: transparent;
+  color: var(--text);
+}}
+
+.highlight .k,
+.highlight .kc,
+.highlight .kd,
+.highlight .kn,
+.highlight .kp,
+.highlight .kr,
+.highlight .o,
+.highlight .ow {{
+  color: #ab4f7a;
+  font-weight: 400;
+}}
+
+.highlight .n,
+.highlight .na,
+.highlight .nb,
+.highlight .bp,
+.highlight .nc,
+.highlight .nd,
+.highlight .ne,
+.highlight .nf,
+.highlight .fm,
+.highlight .nl,
+.highlight .nn,
+.highlight .no,
+.highlight .nv,
+.highlight .vc,
+.highlight .vg,
+.highlight .vi,
+.highlight .vm,
+.highlight .kt {{
+  color: #643cae;
+  font-weight: 400;
+}}
+
+.highlight .s,
+.highlight .s1,
+.highlight .s2,
+.highlight .sa,
+.highlight .sb,
+.highlight .sc,
+.highlight .sd,
+.highlight .se,
+.highlight .sh,
+.highlight .si,
+.highlight .sr,
+.highlight .ss,
+.highlight .sx {{
+  color: #287a4b;
+}}
+
+.highlight .m,
+.highlight .mb,
+.highlight .mf,
+.highlight .mh,
+.highlight .mi,
+.highlight .mo,
+.highlight .il {{
+  color: #9a5a2e;
+}}
+
+.highlight .c,
+.highlight .c1,
+.highlight .ch,
+.highlight .cm,
+.highlight .cp,
+.highlight .cpf,
+.highlight .cs {{
+  color: #737373;
+  font-style: italic;
+}}
+
+.highlight .p {{
+  color: var(--text);
+}}
+
+.highlight .w {{
+  color: inherit;
+}}
+
+@media (max-width: 1199px) {{
   .viewer-grid {{
-    grid-template-columns: 1fr;
+    width: min(48rem, calc(100vw - 2rem));
+    grid-template-columns: minmax(0, 1fr);
+  }}
+
+  .markdown-body,
+  .toc-card {{
+    grid-column: 1;
   }}
 
   .toc-card {{
+    width: 100%;
+    max-height: none;
     position: static;
     order: -1;
+    margin-top: 2rem;
+  }}
+
+  .toc-card + .markdown-body,
+  .markdown-body {{
+    padding-top: 2rem;
   }}
 }}
 
 @media (max-width: 640px) {{
-  .card,
-  .markdown-body,
-  .toc-card,
-  .topbar {{
-    border-radius: 20px;
+  .home-shell,
+  .topbar,
+  .status-banner {{
+    width: calc(100vw - 1.5rem);
   }}
 
-  .card,
-  .markdown-body {{
+  .viewer-grid {{
+    width: calc(100vw - 1.5rem);
+  }}
+
+  .card {{
     padding: 1.25rem;
+    border-radius: 16px;
   }}
 
   .topbar {{
     padding: 1rem;
+    border-radius: 16px;
     flex-direction: column;
+  }}
+
+  .topbar-actions {{
+    width: 100%;
   }}
 
   .row {{
@@ -790,9 +1325,34 @@ button,
   }}
 
   input[type="text"],
-  button,
+  .path-form button,
+  .upload-form button,
   .action-link {{
     width: 100%;
+  }}
+
+  .markdown-body {{
+    padding: 1.75rem 0 3rem;
+  }}
+
+  .code-block-wrap {{
+    border-radius: 18px;
+  }}
+
+  .code-block-header {{
+    padding: 0 16px;
+  }}
+
+  .markdown-body .code-block-wrap pre {{
+    padding: 14px 16px 18px;
+    font-size: 0.84rem;
+  }}
+
+  .toc-card {{
+    margin-top: 1.25rem;
+    max-height: 16rem;
+    overflow-y: auto;
+    border-radius: 14px;
   }}
 }}
 """
@@ -803,7 +1363,16 @@ class RenderedPage:
     title: str
     content_html: str
     toc_html: str
+    has_toc: bool
     mtime_ns: int | None = None
+
+
+@dataclass
+class TocNode:
+    level: int
+    text: str
+    anchor: str
+    children: list[TocNode]
 
 
 @dataclass
@@ -918,6 +1487,8 @@ def build_markdown_renderer() -> MarkdownIt:
     parser.renderer.rules["fence"] = render_fence
     parser.renderer.rules["code_block"] = render_code_block
     parser.renderer.rules["code_inline"] = render_inline_code
+    parser.renderer.rules["table_open"] = render_table_open
+    parser.renderer.rules["table_close"] = render_table_close
     return parser
 
 
@@ -925,35 +1496,106 @@ def encode_copy_payload(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
-def render_copy_link(copy_text: str, classes: str, label: str) -> str:
+def render_copy_button(copy_text: str, classes: str, label: str, button_text: str) -> str:
     payload = html.escape(encode_copy_payload(copy_text), quote=True)
     return (
-        f'<a href="#copy" class="copy-link {classes}" '
-        f'data-copy-b64="{payload}" aria-label="{html.escape(label, quote=True)}"></a>'
+        f'<button type="button" class="copy-control {classes}" '
+        f'data-copy-b64="{payload}" aria-label="{html.escape(label, quote=True)}" '
+        f'title="{html.escape(label, quote=True)}">{html.escape(button_text)}</button>'
+    )
+
+
+CODE_ICON_SVG = (
+    '<svg class="code-block-icon" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" '
+    'stroke-linejoin="round" aria-hidden="true">'
+    '<path d="m8 9-3 3 3 3"></path>'
+    '<path d="m16 9 3 3-3 3"></path>'
+    '<path d="m14 5-4 14"></path>'
+    '</svg>'
+)
+
+COPY_ICON_SVG = (
+    '<svg class="copy-icon" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" '
+    'stroke-linejoin="round" aria-hidden="true">'
+    '<rect x="9" y="9" width="11" height="11" rx="2"></rect>'
+    '<path d="M15 9V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h4"></path>'
+    '</svg>'
+)
+
+
+def code_language_label(language: str) -> str:
+    normalized = (language or "").strip().lower()
+    if not normalized:
+        return "Code"
+    return CODE_LANGUAGE_LABELS.get(normalized, language.strip())
+
+
+def render_code_copy_button(copy_text: str) -> str:
+    payload = html.escape(encode_copy_payload(copy_text), quote=True)
+    return (
+        '<button type="button" class="copy-control copy-control-block" '
+        f'data-copy-b64="{payload}" aria-label="Copy code" title="Copy code">'
+        f'{COPY_ICON_SVG}<span class="sr-only">Copy code</span></button>'
+    )
+
+
+def render_code_panel(code: str, language: str) -> str:
+    highlighted = highlight_code(code, language, "")
+    label = html.escape(code_language_label(language))
+    copy_button = render_code_copy_button(code)
+    return (
+        '<div class="code-block-wrap">'
+        '<div class="code-block-header">'
+        f'<span class="code-language">{CODE_ICON_SVG}'
+        f'<span class="code-language-label">{label}</span></span>'
+        f'{copy_button}</div>{highlighted}</div>'
     )
 
 
 def render_inline_code(tokens: list, index: int, _options: dict, _env: dict) -> str:
     token = tokens[index]
     code_html = html.escape(token.content)
-    copy_link = render_copy_link(token.content, "copy-link-inline", "Copy inline code")
-    return f'<span class="inline-code-wrap"><code>{code_html}</code>{copy_link}</span>'
+    if not token.meta.get("copy_enabled", True):
+        return f"<code>{code_html}</code>"
+    payload = html.escape(encode_copy_payload(token.content), quote=True)
+    return (
+        f'<span class="inline-code-wrap copy-inline" data-copy-b64="{payload}" '
+        f'role="button" tabindex="0" aria-label="Copy inline code" title="Click to copy">'
+        f"<code>{code_html}</code></span>"
+    )
 
 
 def render_fence(tokens: list, index: int, _options: dict, _env: dict) -> str:
     token = tokens[index]
     info = (token.info or "").strip()
     language = info.split(None, 1)[0] if info else ""
-    highlighted = highlight_code(token.content, language, "")
-    copy_link = render_copy_link(token.content, "copy-link-block", "Copy code block")
-    return f'<div class="code-block-wrap">{copy_link}{highlighted}</div>'
+    return render_code_panel(token.content, language)
 
 
 def render_code_block(tokens: list, index: int, _options: dict, _env: dict) -> str:
     code = tokens[index].content
-    highlighted = highlight_code(code, "", "")
-    copy_link = render_copy_link(code, "copy-link-block", "Copy code block")
-    return f'<div class="code-block-wrap">{copy_link}{highlighted}</div>'
+    return render_code_panel(code, "")
+
+
+def render_table_open(tokens: list, index: int, _options: dict, env: dict) -> str:
+    source_lines = env.get("source_lines", [])
+    line_map = tokens[index].map
+    copy_text = ""
+    if line_map and len(line_map) == 2:
+        start, end = line_map
+        copy_text = "".join(source_lines[start:end])
+    copy_button = (
+        render_copy_button(copy_text, "copy-control-table", "Copy table as Markdown", "Copy table")
+        if copy_text
+        else ""
+    )
+    return f'<div class="table-wrap">{copy_button}<div class="table-scroll"><table>'
+
+
+def render_table_close(_tokens: list, _index: int, _options: dict, _env: dict) -> str:
+    return "</table></div></div>"
 
 
 def extract_inline_text(tokens: Iterable) -> str:
@@ -1020,6 +1662,7 @@ def collect_and_rewrite_tokens(tokens: list, base_dir: Path | None) -> tuple[str
     headings: list[tuple[int, str, str]] = []
 
     def walk(token_list: list) -> None:
+        link_depth = 0
         for index, token in enumerate(token_list):
             if token.type == "heading_open":
                 inline_token = token_list[index + 1] if index + 1 < len(token_list) else None
@@ -1035,6 +1678,9 @@ def collect_and_rewrite_tokens(tokens: list, base_dir: Path | None) -> tuple[str
                 level = int(token.tag[1]) if len(token.tag) == 2 and token.tag.startswith("h") else 1
                 headings.append((level, text, slug))
 
+            if token.type == "code_inline":
+                token.meta["copy_enabled"] = link_depth == 0
+
             if token.type == "inline" and token.children:
                 walk(token.children)
                 continue
@@ -1045,6 +1691,9 @@ def collect_and_rewrite_tokens(tokens: list, base_dir: Path | None) -> tuple[str
                     token.attrSet("href", rewrite_local_url(href, base_dir))
                     token.attrSet("rel", "noreferrer")
                     token.attrSet("target", "_blank" if urlsplit(href).scheme in {"http", "https"} else "_self")
+                link_depth += 1
+            elif token.type == "link_close":
+                link_depth = max(0, link_depth - 1)
             elif token.type == "image":
                 src = token.attrGet("src")
                 if src is not None:
@@ -1059,19 +1708,65 @@ def build_toc_html(headings: list[tuple[int, str, str]]) -> str:
     if not headings:
         return '<p class="toc-empty">No headings found.</p>'
 
-    items = ["<ul class='toc-list'>"]
+    roots: list[TocNode] = []
+    stack: list[TocNode] = []
     for level, text, anchor in headings:
-        items.append(f"<li class='toc-level-{level}'><a href='#{html.escape(anchor)}'>{html.escape(text)}</a></li>")
-    items.append("</ul>")
-    return "".join(items)
+        node = TocNode(level=level, text=text, anchor=anchor, children=[])
+        while stack and stack[-1].level >= level:
+            stack.pop()
+        if stack:
+            stack[-1].children.append(node)
+        else:
+            roots.append(node)
+        stack.append(node)
+
+    def render_nodes(nodes: list[TocNode], *, root: bool = False) -> str:
+        list_class = "toc-list" if root else "toc-children"
+        parts = [f'<ul class="{list_class}"' + ("" if root else " hidden") + ">"]
+        for node in nodes:
+            anchor = html.escape(node.anchor, quote=True)
+            text = html.escape(node.text)
+            text_attr = html.escape(node.text, quote=True)
+            item_class = "toc-item has-children" if node.children else "toc-item"
+            parts.append(
+                f'<li class="{item_class}" data-anchor="{anchor}" data-toc-text="{text_attr}">'
+                '<div class="toc-row">'
+            )
+            if node.children:
+                parts.append(
+                    f'<button type="button" class="toc-toggle" aria-expanded="false" '
+                    f'aria-controls="toc-children-{anchor}" aria-label="Expand {text_attr}"></button>'
+                )
+            else:
+                parts.append('<span class="toc-toggle-spacer" aria-hidden="true"></span>')
+            parts.append(f'<a class="toc-link" href="#{anchor}">{text}</a></div>')
+            if node.children:
+                children_html = render_nodes(node.children)
+                children_html = children_html.replace(
+                    '<ul class="toc-children" hidden>',
+                    f'<ul id="toc-children-{anchor}" class="toc-children" hidden>',
+                    1,
+                )
+                parts.append(children_html)
+            parts.append("</li>")
+        parts.append("</ul>")
+        return "".join(parts)
+
+    return render_nodes(roots, root=True)
 
 
 def render_markdown(text: str, source_path: Path | None = None) -> RenderedPage:
     parser = build_markdown_renderer()
     tokens = parser.parse(text)
     title, headings = collect_and_rewrite_tokens(tokens, source_path.parent if source_path else None)
-    content_html = parser.renderer.render(tokens, parser.options, {})
-    return RenderedPage(title=title, content_html=content_html, toc_html=build_toc_html(headings))
+    render_env = {"source_lines": text.splitlines(keepends=True)}
+    content_html = parser.renderer.render(tokens, parser.options, render_env)
+    return RenderedPage(
+        title=title,
+        content_html=content_html,
+        toc_html=build_toc_html(headings),
+        has_toc=bool(headings),
+    )
 
 
 def normalize_markdown_path(path_value: str, cwd_value: str | None = None) -> Path:
@@ -1121,6 +1816,7 @@ def render_document_page(
         base_css=BASE_CSS,
         content_html=page.content_html,
         toc_html=page.toc_html,
+        has_toc=page.has_toc,
         source_name=source_name,
         source_description=source_description,
         source_path=source_path,
@@ -1239,6 +1935,7 @@ def fragment() -> Response:
             "title": page.title,
             "content_html": page.content_html,
             "toc_html": page.toc_html,
+            "has_toc": page.has_toc,
             "mtime_ns": page.mtime_ns,
         }
     )

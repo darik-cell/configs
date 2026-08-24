@@ -211,6 +211,10 @@ local function notify_invalid_mdview()
   vim.notify("mdview supports only .md and .markdown files", vim.log.levels.WARN)
 end
 
+local function notify_invalid_live_preview()
+  vim.notify("live-preview supports only .md and .markdown files", vim.log.levels.WARN)
+end
+
 local function current_path()
   return vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":p")
 end
@@ -242,6 +246,33 @@ local function open_in_editor(path)
     vim.api.nvim_set_current_win(win)
   end
   open_in_current_editor(path)
+end
+
+function M.open_live_preview(path)
+  path = vim.fn.fnamemodify(path or "", ":p")
+  if not workspace.is_markdown(path) then
+    notify_invalid_live_preview()
+    return
+  end
+
+  vim.api.nvim_cmd({
+    cmd = "LivePreview",
+    args = { "start", path },
+  }, {})
+end
+
+function M.open_current_buffer_in_live_preview()
+  M.open_live_preview(current_path())
+end
+
+function M.open_tree_node_in_live_preview(state)
+  local node = state and state.tree and state.tree:get_node() or nil
+  if not node or node.type ~= "file" then
+    notify_invalid_live_preview()
+    return
+  end
+
+  M.open_live_preview(node.path)
 end
 
 function M.open_mdview(path)

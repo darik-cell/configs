@@ -74,6 +74,15 @@ return {
     },
   },
   {
+    "brianhuster/live-preview.nvim",
+    cmd = "LivePreview",
+    config = function()
+      require("config.live_preview").setup({
+        dynamic_root = true,
+      })
+    end,
+  },
+  {
     "nvim-neo-tree/neo-tree.nvim",
     branch = "v3.x",
     dependencies = {
@@ -105,6 +114,9 @@ return {
           },
           mappings = {
             ["<leader>m"] = function(state)
+              require("config.markdown").open_tree_node_in_live_preview(state)
+            end,
+            ["<leader>M"] = function(state)
               require("config.markdown").open_tree_node_in_mdview(state)
             end,
           },

@@ -179,6 +179,16 @@ vim.api.nvim_create_autocmd("BufEnter", {
     vim.keymap.set("n", "<leader>m", function()
       local manager = require("neo-tree.sources.manager")
       local state = manager.get_state("filesystem")
+      markdown.open_tree_node_in_live_preview(state)
+    end, {
+      buffer = true,
+      silent = true,
+      desc = "Open selected markdown in live preview",
+    })
+
+    vim.keymap.set("n", "<leader>M", function()
+      local manager = require("neo-tree.sources.manager")
+      local state = manager.get_state("filesystem")
       markdown.open_tree_node_in_mdview(state)
     end, {
       buffer = true,
