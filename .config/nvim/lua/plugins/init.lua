@@ -127,6 +127,7 @@ return {
             mappings = {
               ["<CR>"] = tree.open_selected,
               ["o"] = { tree.open_selected, nowait = true },
+              ["z"] = "none",
               ["zz"] = function()
                 tree.scroll("zz")
               end,
@@ -136,6 +137,15 @@ return {
               ["z<cr>"] = function()
                 tree.scroll("z<CR>")
               end,
+              ["я<cr>"] = function()
+                tree.scroll("z<CR>")
+              end,
+              ["x"] = "close_node",
+              ["ч"] = "close_node",
+              ["X"] = "cut_to_clipboard",
+              ["Ч"] = "cut_to_clipboard",
+              ["p"] = tree.focus_parent,
+              ["з"] = tree.focus_parent,
               ["."] = tree.set_root_and_tcd,
               ["<leader>cp"] = tree.copy_selected_path,
               ["oc"] = "none",
@@ -228,28 +238,10 @@ return {
     "nvim-treesitter/nvim-treesitter",
     build = ":TSUpdate",
     config = function()
-      local languages = {
-          "bash",
-          "css",
-          "diff",
-          "html",
-          "javascript",
-          "json",
-          "json5",
-          "lua",
-          "markdown",
-          "markdown_inline",
-          "query",
-          "toml",
-          "typescript",
-          "vim",
-          "vimdoc",
-          "yaml",
-      }
+      local tooling = require("config.tooling")
 
-      require("nvim-treesitter").setup({
-        install = languages,
-      })
+      require("nvim-treesitter").setup({})
+      tooling.install_treesitter()
     end,
   },
   {
@@ -265,17 +257,10 @@ return {
       "neovim/nvim-lspconfig",
     },
     config = function()
+      local tooling = require("config.tooling")
+
       require("mason-lspconfig").setup({
-        ensure_installed = {
-          "bashls",
-          "cssls",
-          "html",
-          "jsonls",
-          "lua_ls",
-          "marksman",
-          "taplo",
-          "yamlls",
-        },
+        ensure_installed = tooling.lsp_names(),
         automatic_enable = false,
       })
     end,
@@ -330,30 +315,10 @@ return {
     },
     config = function()
       local capabilities = require("blink.cmp").get_lsp_capabilities()
+      local tooling = require("config.tooling")
 
-      local servers = {
-        bashls = {},
-        cssls = {},
-        html = {},
-        jsonls = {},
-        marksman = {},
-        taplo = {},
-        yamlls = {},
-        lua_ls = {
-          settings = {
-            Lua = {
-              completion = {
-                callSnippet = "Replace",
-              },
-              diagnostics = {
-                globals = { "vim" },
-              },
-            },
-          },
-        },
-      }
-
-      for server, config in pairs(servers) do
+      for _, server in ipairs(tooling.lsp_names()) do
+        local config = tooling.lsp_config(server)
         config.capabilities = capabilities
         vim.lsp.config(server, config)
         vim.lsp.enable(server)

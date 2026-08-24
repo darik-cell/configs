@@ -380,6 +380,18 @@ function M.open_selected(state)
   open_file_in_target(path)
 end
 
+function M.focus_parent(state)
+  local node = state and state.tree and state.tree:get_node() or nil
+  if not node then
+    return
+  end
+
+  local parent_id = node:get_parent_id()
+  if parent_id and state.tree:get_node(parent_id) then
+    renderer().focus_node(state, parent_id)
+  end
+end
+
 function M.open_path(path)
   if not path or path == "" then
     return
